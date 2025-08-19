@@ -1,0 +1,7 @@
+streamlit
+monai==1.5.0
+nibabel
+pydicom
+SimpleITK
+huggingface_hub
+numpy
