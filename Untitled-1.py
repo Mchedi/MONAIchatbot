@@ -19,18 +19,19 @@ import gzip
 from monai.transforms import (
     Compose, EnsureChannelFirstd, LoadImaged, Orientationd,
     Spacingd, ScaleIntensityRanged, CropForegroundd, ToTensord,
-    EnsureTyped, SqueezeDimd
+    EnsureTyped, ResizeD
 )
 from monai.inferers import sliding_window_inference
 from monai.bundle import ConfigParser
 from monai.networks.nets import UNet
+from monai.transforms import Lambdad
 
 # ------------------------------
 # UI CONFIG
 # ------------------------------
-st.set_page_config(page_title="MONAI 1.5 Web App", layout="wide")
-st.title("🩺 MONAI 1.5 – Medical Imaging Inference App")
-st.caption("Upload an image, choose a model, run inference, and visualize slices.")
+st.set_page_config(page_title="MONAI 1.5 Application Web", layout="wide")
+st.title("🩺 MONAI 1.5 – Application d'Inférence d'Imagerie Médicale")
+st.caption("Téléchargez une image, choisissez un modèle, lancez l'inférence, et visualisez les coupes.")
 
 # ------------------------------
 # HELPERS
@@ -109,36 +110,60 @@ def load_bundle_from_hf(repo_id: str) -> Tuple[torch.nn.Module, dict, str]:
     net, infer_cfg = load_bundle_from_local(cache_dir)
     return net, infer_cfg, cache_dir
 
-def build_transforms(is_3d: bool, target_spacing: Tuple[float, ...], intensity_range: Tuple[float, float], is_dicom: bool = False, keys=("image",)):
+def build_transforms(is_3d: bool,
+                     target_spacing: Tuple[float, ...],
+                     intensity_range: Tuple[float, float],
+                     is_dicom: bool = False,
+                     keys=("image",)):
+    # 1️⃣ Grab the inferer_cfg object – it may be a dict or a component
+    inferer_cfg_obj = getattr(st.session_state, "inferer_cfg", None)
+
+    # 2️⃣ Create a dict‑like view that always supports .get()
+    if isinstance(inferer_cfg_obj, dict):
+        inferer_cfg_dict = inferer_cfg_obj
+    else:
+        # Try to expose the component’s attributes as a dict
+        try:
+            inferer_cfg_dict = vars(inferer_cfg_obj)
+        except Exception:
+            inferer_cfg_dict = {}   # fallback empty dict
+
+    # 3️⃣ Now we can safely use .get()
+    roi = inferer_cfg_dict.get("roi_size")
+
+    # -----------------------------------------------------------------
+    # Convert to a tuple of ints and keep the right dimensionality
+    # -----------------------------------------------------------------
+    if roi is not None:
+        max_dims = 3 if is_3d else 2
+        roi = tuple(int(v) for v in roi[:max_dims])
+
     tr = [
         LoadImaged(keys=keys, ensure_channel_first=True, image_only=False),
         EnsureChannelFirstd(keys=keys),
+        Lambdad(keys=keys, func=lambda x: x.squeeze()),
+        EnsureChannelFirstd(keys=keys),
     ]
-    
-    # Add dimension squeezing for 4D+ volumes to handle extra dimensions
-    # This will remove singleton dimensions that might cause orientation issues
-    tr.append(SqueezeDimd(keys=keys, dim=None))  # Remove all singleton dimensions
-    
-    # Re-ensure channel first after squeezing
-    tr.append(EnsureChannelFirstd(keys=keys))
-    
-    # Only apply orientation if not DICOM and we have proper spatial dimensions
+
+    # OPTIONAL: force the expected spatial size (highly recommended)
+    if roi is not None:
+        tr.append(ResizeD(keys=keys, spatial_size=roi, mode="area"))
+
     if not is_dicom:
         try:
             tr.append(Orientationd(keys=keys, axcodes="RAS"))
         except Exception:
-            # If orientation fails, skip it and continue with other transforms
-            st.warning("Skipping orientation transform due to incompatible data dimensions")
-    
+            st.warning("Ignorer la transformation d'orientation en raison de dimensions incompatibles")
+
     tr.extend([
         Spacingd(keys=keys, pixdim=target_spacing, mode="bilinear"),
         ScaleIntensityRanged(
-            keys=keys, 
-            a_min=intensity_range[0], 
-            a_max=intensity_range[1], 
-            b_min=0.0, 
-            b_max=1.0, 
-            clip=True
+            keys=keys,
+            a_min=intensity_range[0],
+            a_max=intensity_range[1],
+            b_min=0.0,
+            b_max=1.0,
+            clip=True,
         ),
         CropForegroundd(keys=keys, source_key=keys[0]),
         EnsureTyped(keys=keys),
@@ -180,19 +205,19 @@ def visualize_slices(volume: np.ndarray, mask: Optional[np.ndarray] = None, titl
     
     # Handle different volume dimensions - more robust approach
     original_shape = volume.shape
-    st.info(f"Volume shape before processing: {original_shape}")
+    st.info(f"Forme du volume avant traitement : {original_shape}")
     
     # Handle multi-channel volumes (4D: channels, depth, height, width)
     if volume.ndim == 4:
         if volume.shape[0] == 1:
             # Single channel case
             volume = volume.squeeze(0)
-            st.info(f"Squeezed single channel volume to shape: {volume.shape}")
+            st.info(f"Volume à canal unique réduit à la forme : {volume.shape}")
         else:
             # Multi-channel case - take first channel or create composite
-            st.warning(f"Multi-channel volume detected ({volume.shape[0]} channels). Using first channel for visualization.")
+            st.warning(f"Volume multi-canaux détecté ({volume.shape[0]} canaux). Utilisation du premier canal pour la visualisation.")
             volume = volume[0]  # Take first channel
-            st.info(f"Using first channel, new shape: {volume.shape}")
+            st.info(f"Première canal utilisé, nouvelle forme : {volume.shape}")
     
     # Handle mask dimensions similarly
     if mask is not None:
@@ -215,7 +240,7 @@ def visualize_slices(volume: np.ndarray, mask: Optional[np.ndarray] = None, titl
         # 2D image
         slices = [(volume, mask, "2D")]
     else:
-        st.error(f"Cannot visualize volume with {volume.ndim} dimensions")
+        st.error(f"Impossible de visualiser le volume avec {volume.ndim} dimensions")
         return
 
     # Create visualization
@@ -226,7 +251,7 @@ def visualize_slices(volume: np.ndarray, mask: Optional[np.ndarray] = None, titl
             
             # Ensure image is 2D for matplotlib
             if img.ndim > 2:
-                st.warning(f"Image slice still {img.ndim}D, taking first slice/channel")
+                st.warning(f"L'image de coupe est encore {img.ndim}D, on prend la première tranche/canal")
                 img = img.squeeze()
                 if img.ndim > 2:
                     img = img[..., 0] if img.shape[-1] < img.shape[0] else img[0]
@@ -249,19 +274,19 @@ def visualize_slices(volume: np.ndarray, mask: Optional[np.ndarray] = None, titl
             plt.close(fig)
             
         except Exception as viz_error:
-            col.error(f"Visualization failed for {name}: {str(viz_error)}")
-            st.info(f"Image shape: {img.shape}, Mask shape: {msk.shape if msk is not None else 'None'}")
+            col.error(f"Échec de la visualisation pour {name} : {str(viz_error)}")
+            st.info(f"Forme de l'image : {img.shape}, Forme du masque : {msk.shape if msk is not None else 'None'}")
 
 def validate_and_parse_inputs(spacing_input: str, intensity_input: str, is_3d: bool):
     """Validate and parse spacing and intensity inputs"""
     spacing_values = [x.strip() for x in spacing_input.split(",")]
     expected_dims = 3 if is_3d else 2
     if len(spacing_values) != expected_dims:
-        raise ValueError(f"Spacing must have {expected_dims} values for {'3D' if is_3d else '2D'}")
+        raise ValueError(f"L'espacement doit contenir {expected_dims} valeurs pour {'3D' if is_3d else '2D'}")
     
     intensity_values = [x.strip() for x in intensity_input.split(",")]
     if len(intensity_values) != 2:
-        raise ValueError("Intensity range must have exactly 2 values (a_min,a_max)")
+        raise ValueError("L'intervalle d'intensité doit contenir exactement 2 valeurs (a_min,a_max)")
     
     tgt_spacing = tuple(float(x) for x in spacing_values)
     a_min, a_max = (float(x) for x in intensity_values)
@@ -275,15 +300,15 @@ def preprocess_image_data(data_dict, transforms, fallback_transforms=None):
         result = transforms(data_dict)
         return result, "primary"
     except Exception as primary_error:
-        st.warning(f"Primary preprocessing failed: {str(primary_error)}")
+        st.warning(f"Le prétraitement principal a échoué : {str(primary_error)}")
         
         if fallback_transforms is not None:
             try:
-                st.info("Attempting fallback preprocessing...")
+                st.info("Tentative de prétraitement de secours...")
                 result = fallback_transforms(data_dict)
                 return result, "fallback"
             except Exception as fallback_error:
-                st.error(f"Fallback preprocessing also failed: {str(fallback_error)}")
+                st.error(f"Le prétraitement de secours a également échoué : {str(fallback_error)}")
                 raise fallback_error
         else:
             raise primary_error
@@ -302,49 +327,52 @@ if "bundle_path" not in st.session_state:
 # SIDEBAR – MODEL SOURCES
 # ------------------------------
 with st.sidebar:
-    st.header("Model Source")
-    model_source = st.radio("Choose how to load your model:", [
-        "MONAI Bundle from Hugging Face",
-        "MONAI Bundle from Local Folder", 
-        "Torch/TorchScript File",
-        "Fallback Demo UNet",
-    ], key="model_source_radio")
+    st.header("Source du Modèle")
+    model_source = st.radio(
+        "Choisissez comment charger votre modèle :",
+        [
+            "Lot MONAI depuis Hugging Face",
+            "Lot MONAI depuis un Dossier Local",
+            "Fichier Torch/TorchScript",
+            "UNet de démonstration (fallback)",
+        ],
+        key="model_source_radio")
 
-    if model_source == "MONAI Bundle from Hugging Face":
-        repo_id = st.text_input("Hugging Face repo id (e.g., Project-MONAI/xxx)", key="hf_repo_input")
-        if st.button("Download & Load Bundle", key="download_hf_btn") and repo_id:
-            with st.spinner("Downloading bundle..."):
+    if model_source == "Lot MONAI depuis Hugging Face":
+        repo_id = st.text_input("Identifiant du repo Hugging Face (ex.: Project-MONAI/xxx)", key="hf_repo_input")
+        if st.button("Télécharger & Charger le Lot", key="download_hf_btn") and repo_id:
+            with st.spinner("Téléchargement du lot..."):
                 try:
                     net, inferer_cfg, bundle_path = load_bundle_from_hf(repo_id)
                     st.session_state.net = net
                     st.session_state.inferer_cfg = inferer_cfg
                     st.session_state.bundle_path = bundle_path
-                    st.success(f"Loaded bundle from {repo_id}")
-                    st.caption(f"Local cache: {bundle_path}")
+                    st.success(f"Lot chargé depuis {repo_id}")
+                    st.caption(f"Cache local : {bundle_path}")
                 except Exception as e:
-                    st.error(f"Failed to load bundle: {str(e)}")
+                    st.error(f"Échec du chargement du lot : {str(e)}")
 
-    elif model_source == "MONAI Bundle from Local Folder":
-        folder = st.text_input("Path to local bundle folder", key="local_folder_input")
-        if st.button("Load Local Bundle", key="load_local_btn") and folder:
+    elif model_source == "Lot MONAI depuis un Dossier Local":
+        folder = st.text_input("Chemin du dossier du bundle local", key="local_folder_input")
+        if st.button("Charger le Bundle Local", key="load_local_btn") and folder:
             try:
                 net, inferer_cfg = load_bundle_from_local(folder)
                 st.session_state.net = net
                 st.session_state.inferer_cfg = inferer_cfg
                 st.session_state.bundle_path = folder
-                st.success("Loaded local bundle")
+                st.success("Lot local chargé")
             except Exception as e:
-                st.error(f"Failed to load local bundle: {str(e)}")
+                st.error(f"Échec du chargement du lot local : {str(e)}")
 
-    elif model_source == "Torch/TorchScript File":
-        up_model = st.file_uploader("Upload .pt/.pth Torch model", type=["pt","pth"], key="torch_uploader")
-        arch = st.selectbox("Architecture for state_dict", ["UNet 3D (default)", "UNet 2D (default)"], key="arch_select")
-        if st.button("Load Torch model", key="load_torch_btn") and up_model is not None:
+    elif model_source == "Fichier Torch/TorchScript":
+        up_model = st.file_uploader("Uploader le modèle Torch (.pt/.pth)", type=["pt","pth"], key="torch_uploader")
+        arch = st.selectbox("Architecture du state_dict", ["UNet 3D (default)", "UNet 2D (default)"], key="arch_select")
+        if st.button("Charger le modèle Torch", key="load_torch_btn") and up_model is not None:
             mpath = save_uploaded_file(up_model)
             try:
                 net = torch.jit.load(mpath, map_location="cpu")
                 st.session_state.net = net
-                st.success("TorchScript model loaded")
+                st.success("Modèle TorchScript chargé")
             except Exception:
                 try:
                     is_3d = arch.startswith("UNet 3D")
@@ -355,82 +383,84 @@ with st.sidebar:
                     else:
                         net.load_state_dict(state)
                     st.session_state.net = net
-                    st.success("State dict model loaded")
+                    st.success("Modèle state_dict chargé")
                 except Exception as e:
-                    st.error(f"Failed to load model: {str(e)}")
+                    st.error(f"Échec du chargement du modèle : {str(e)}")
 
     else:  # Demo UNet
-        dims = st.selectbox("Demo network dims", ["3D","2D"], key="demo_dims_select")
-        in_ch = st.number_input("Input channels",1,4,1, key="in_ch_input")
-        out_ch = st.number_input("Output channels/classes",2,10,2, key="out_ch_input")
-        if st.button("Create Demo Net", key="create_demo_btn"):
+        dims = st.selectbox("Dimensions du réseau de démonstration", ["3D","2D"], key="demo_dims_select")
+        in_ch = st.number_input("Canaux d'entrée",1,4,1, key="in_ch_input")
+        out_ch = st.number_input("Canaux de sortie/classes",2,10,2, key="out_ch_input")
+        if st.button("Créer le réseau de démonstration", key="create_demo_btn"):
             net = make_default_network(in_channels=in_ch, out_channels=out_ch, is_3d=(dims=="3D"))
             st.session_state.net = net
-            st.success("Demo network created (random weights)")
+            st.success("Réseau de démonstration créé (poids aléatoires)")
 
 # ------------------------------
 # UPLOAD IMAGE
 # ------------------------------
-st.header("1) Upload Image")
-file_type = st.radio("Upload type:", ["NIfTI (.nii/.nii.gz)", "DICOM (ZIP of series)"], key="upload_type_radio")
+st.header("1) Importer une image")
+file_type = st.radio("Type de téléchargement :", ["NIfTI (.nii/.nii.gz)", "DICOM (ZIP de série)"], key="upload_type_radio")
 
 img_path = ""
 img_folder = ""
 dicom_files = []
 
 if file_type.startswith("NIfTI"):
-    up = st.file_uploader("Upload NIfTI file", type=["nii","nii.gz"], key="nifti_uploader")
+    up = st.file_uploader("Uploader un fichier NIfTI", type=["nii","nii.gz"], key="nifti_uploader")
     if up is not None:
         try:
             img_path = save_uploaded_file(up)
-            st.success(f"Image uploaded: {up.name}")
-            st.info(f"File size: {os.path.getsize(img_path)} bytes")
+            st.success(f"Image téléversée : {up.name}")
+            st.info(f"Taille du fichier : {os.path.getsize(img_path)} octets")
             
             # Test if file can be loaded and show dimensions
             try:
                 test_img = nib.load(img_path)
-                st.info(f"Image shape: {test_img.shape}, dtype: {test_img.get_fdata().dtype}")
+                st.info(f"Forme de l'image : {test_img.shape}, type de données : {test_img.get_fdata().dtype}")
                 
                 # Warn about potential dimension issues
                 if len(test_img.shape) > 3:
-                    st.warning(f"Image has {len(test_img.shape)} dimensions. This may cause orientation transform issues. Consider using fallback preprocessing if errors occur.")
+                    st.warning(f"L'image possède {len(test_img.shape)} dimensions. Cela peut causer des problèmes avec la transformation d'orientation. Envisagez d'utiliser le prétraitement de secours si des erreurs surviennent.")
                     
             except Exception as load_test_error:
-                st.error(f"File validation failed: {load_test_error}")
+                st.error(f"Échec de la validation du fichier : {load_test_error}")
                 img_path = ""
                 
         except Exception as save_error:
-            st.error(f"Failed to save uploaded file: {save_error}")
+            st.error(f"Échec de l'enregistrement du fichier téléversé : {save_error}")
             img_path = ""
 
 else:  # DICOM
-    up = st.file_uploader("Upload DICOM ZIP", type=["zip"], key="dicom_uploader")
+    up = st.file_uploader("Uploader le ZIP DICOM", type=["zip"], key="dicom_uploader")
     if up is not None:
         img_folder = extract_zip_to_temp(up.read())
-        dicom_files = sorted(glob.glob(os.path.join(img_folder, "**", "*.dcm"), recursive=True) +
-                        glob.glob(os.path.join(img_folder, "**", "*.DCM"), recursive=True))
+        dicom_files = sorted(
+            glob.glob(os.path.join(img_folder, "**", "*.dcm"), recursive=True) +
+            glob.glob(os.path.join(img_folder, "**", "*.DCM"), recursive=True)
+        )
     
     if dicom_files:
-        st.success(f"DICOM ZIP extracted ({len(dicom_files)} files found)")
+        st.success(f"ZIP DICOM extrait ({len(dicom_files)} fichiers trouvés)")
     else:
-        st.warning("No DICOM files found in the ZIP. Make sure files are inside ZIP and have .dcm extension.")
+        st.warning("Aucun fichier DICOM trouvé dans le ZIP. Assurez-vous que les fichiers sont à l'intérieur du ZIP et ont l'extension .dcm.")
 
 # ------------------------------
 # PREPROCESSING OPTIONS
 # ------------------------------
-st.header("2) Preprocessing")
-is_3d = st.checkbox("Treat as 3D volume", value=True, key="is_3d_checkbox")
-spacing = st.text_input("Target spacing (comma-separated)", value="1.5,1.5,2.0" if is_3d else "0.8,0.8", key="spacing_input")
-intens = st.text_input("Intensity range (a_min,a_max)", value="-1000,1000", key="intensity_input")
+st.header("2) Prétraitement")
+is_3d = st.checkbox("Traiter comme un volume 3D", value=True, key="is_3d_checkbox")
+spacing = st.text_input("Espacement cible (séparé par des virgules)", value="1.5,1.5,2.0" if is_3d else "0.8,0.8", key="spacing_input")
+intens = st.text_input("Intervalle d'intensité (a_min,a_max)", value="-1000,1000", key="intensity_input")
 
 # Add option for robust preprocessing
-robust_preprocessing = st.checkbox("Use robust preprocessing (recommended for problematic images)", value=True, key="robust_preprocessing")
+robust_preprocessing = st.checkbox("Utiliser le prétraitement robuste (recommandé pour les images problématiques)", value=True, key="robust_preprocessing")
 
 try:
     tgt_spacing, intensity_range = validate_and_parse_inputs(spacing, intens, is_3d)
     a_min, a_max = intensity_range
 except ValueError as e:
-    st.error(f"Input error: {e}")
+    st.error(f"Erreur d'entrée : {e}")
     st.stop()
 
 is_dicom = file_type.startswith("DICOM")
@@ -456,12 +486,12 @@ else:
 # ------------------------------
 # RUN INFERENCE
 # ------------------------------
-st.header("3) Run Inference")
+st.header("3) Lancer l'Inférence")
 net = st.session_state.net
 inferer_cfg = st.session_state.inferer_cfg
 
 if net is not None:
-    with st.expander("Model Information", expanded=False):
+    with st.expander("Informations sur le Modèle", expanded=False):
         expected_channels = None
         expected_classes = None
         
@@ -481,17 +511,17 @@ if net is not None:
                 if hasattr(module, 'out_channels'):
                     expected_classes = module.out_channels
                     
-        st.write(f"**Expected input channels:** {expected_channels if expected_channels else 'Unknown'}")
-        st.write(f"**Expected output classes:** {expected_classes if expected_classes else 'Unknown'}")
-        st.write(f"**Model type:** {type(net).__name__}")
+        st.write(f"**Canaux d'entrée attendus :** {expected_channels if expected_channels else 'Inconnu'}")
+        st.write(f"**Classes de sortie attendues :** {expected_classes if expected_classes else 'Inconnu'}")
+        st.write(f"**Type de modèle :** {type(net).__name__}")
 
 if net is None:
-    st.warning("Please load or create a model first from the sidebar.")
+    st.warning("Veuillez d'abord charger ou créer un modèle depuis la barre latérale.")
 elif not (img_path or dicom_files):
-    st.warning("Please upload an image first.")
+    st.warning("Veuillez d'abord télécharger une image.")
 else:
-    if st.button("Run Inference", key="run_inference_btn"):
-        st.info("Running preprocessing and inference...")
+    if st.button("Lancer l'Inférence", key="run_inference_btn"):
+        st.info("Exécution du prétraitement et de l'inférence...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         net = net.to(device)
 
@@ -507,7 +537,7 @@ else:
             transformed = []
             for d in data_dicts:
                 try:
-                    st.info(f"Applying transforms to: {d.get('image', 'unknown')}")
+                    st.info(f"Application des transformations à : {d.get('image', 'unknown')}")
                     
                     # Use the robust preprocessing function
                     transformed_sample, preprocess_type = preprocess_image_data(
@@ -515,41 +545,41 @@ else:
                     )
                     
                     if preprocess_type == "fallback":
-                        st.info("✓ Fallback preprocessing successful")
+                        st.info("✓ Prétraitement de secours réussi")
                     else:
-                        st.info("✓ Primary preprocessing successful")
+                        st.info("✓ Prétraitement principal réussi")
                     
                     # Debug: show transformed image info
                     img_tensor = transformed_sample["image"]
-                    st.info(f"Transformed image shape: {img_tensor.shape}, dtype: {img_tensor.dtype}")
+                    st.info(f"Forme de l'image transformée : {img_tensor.shape}, type : {img_tensor.dtype}")
                     
                     transformed.append(transformed_sample)
                     
                 except Exception as transform_error:
-                    st.error(f"All preprocessing methods failed for {d.get('image', 'unknown')}")
+                    st.error(f"Toutes les méthodes de prétraitement ont échoué pour {d.get('image', 'unknown')}")
                     
                     # Enhanced error reporting
                     error_str = str(transform_error)
-                    if "axcodes must match data_array spatially" in error_str:
-                        st.error("❌ Orientation Transform Error: Image dimensions incompatible with orientation transform")
-                        st.info("💡 **Solutions:**\n"
-                               "- Enable 'Use robust preprocessing'\n"
-                               "- Try uploading a different image format\n" 
-                               "- Check if image has extra dimensions (4D+)")
+                    if "axcodes must match data_array spatially" in error_str or "Orientationd" in error_str:
+                        st.error("❌ Erreur de transformation d'orientation : dimensions de l'image incompatibles avec la transformation d'orientation")
+                        st.info("💡 **Solutions :**\n"
+                                "- Activer le prétraitement robuste\n"
+                                "- Essayer de téléverser un format d'image différent\n"
+                                "- Vérifier si l'image possède des dimensions supplémentaires (4D+)")
                     elif "No such file or directory" in error_str:
-                        st.error("File not found - upload may have failed")
+                        st.error("Fichier introuvable - le téléversement a peut‑être échoué")
                     elif "cannot identify image file" in error_str:
-                        st.error("Invalid image format - ensure file is a valid NIfTI or DICOM")
+                        st.error("Format d'image invalide - assurez‑vous que le fichier est un NIfTI ou DICOM valide")
                     elif "Header is not compatible" in error_str:
-                        st.error("Corrupted or invalid NIfTI header")
+                        st.error("En‑tête NIfTI corrompu ou invalide")
                     
-                    with st.expander("Full Error Details"):
+                    with st.expander("Détails complets de l'erreur"):
                         import traceback
                         st.code(traceback.format_exc())
                     st.stop()
             
             if not transformed:
-                st.error("No valid data after transformations")
+                st.error("Aucune donnée valide après les transformations")
                 st.stop()
 
             # Run inference on transformed data
@@ -570,19 +600,19 @@ else:
                                 break
                     
                     if expected_channels and input_channels != expected_channels:
-                        st.warning(f"Channel mismatch: Model expects {expected_channels} channels, but input has {input_channels}")
+                        st.warning(f"Mauvaise correspondance de canaux : le modèle attend {expected_channels} canaux, mais l'entrée en possède {input_channels}")
                         
                         if input_channels == 1 and expected_channels > 1:
-                            st.info(f"Replicating single channel {expected_channels} times to match model input")
+                            st.info(f"Réplication du canal unique {expected_channels} fois pour correspondre à l'entrée du modèle")
                             image_tensor = image_tensor.repeat(1, expected_channels, 1, 1, 1)
                         elif input_channels > 1 and expected_channels == 1:
-                            st.info("Using only first channel from multi-channel input")
+                            st.info("Utilisation du premier canal uniquement")
                             image_tensor = image_tensor[:, :1, ...]
                         elif input_channels > expected_channels:
-                            st.info(f"Using first {expected_channels} channels from {input_channels}-channel input")
+                            st.info(f"Utilisation des {expected_channels} premiers canaux d'une entrée à {input_channels} canaux")
                             image_tensor = image_tensor[:, :expected_channels, ...]
                         else:
-                            st.info(f"Padding input from {input_channels} to {expected_channels} channels with zeros")
+                            st.info(f"Remplissage de l'entrée de {input_channels} à {expected_channels} canaux avec des zéros")
                             padding_channels = expected_channels - input_channels
                             padding = torch.zeros(1, padding_channels, *image_tensor.shape[2:], device=device)
                             image_tensor = torch.cat([image_tensor, padding], dim=1)
@@ -638,28 +668,28 @@ else:
                         nib.save(nib.Nifti1Image(msk, affine=np.eye(4)), out_path)
                         with open(out_path, "rb") as f:
                             st.download_button( 
-                                "Download predicted mask (.nii.gz)", 
+                                "Télécharger le masque prédit (.nii.gz)", 
                                 data=f.read(), 
                                 file_name="prediction_mask.nii.gz",
                                 mime="application/gzip",
                                 key="download_btn"
                             )
                     except Exception as export_error:
-                        st.warning(f"Could not export NIfTI: {export_error}")
+                        st.warning(f"Impossible d'exporter le fichier NIfTI : {export_error}")
 
                 except RuntimeError as e:
                     if "CUDA out of memory" in str(e):
-                        st.error("GPU out of memory - try smaller ROI size or 2D model")
+                        st.error("Mémoire GPU insuffisante - essayez une taille de ROI plus petite ou un modèle 2D")
                     else:
-                        st.error(f"Inference failed: {str(e)}")
+                        st.error(f"Échec de l'inférence : {str(e)}")
                     st.stop()
 
-            st.success("✅ Inference completed successfully!")
+            st.success("✅ Inférence terminée avec succès !")
 
         except Exception as e:
-            st.error(f"Unexpected error: {str(e)}")
+            st.error(f"Erreur inattendue : {str(e)}")
             import traceback
-            st.error(f"Full traceback: {traceback.format_exc()}")
+            st.error(f"Trace complète : {traceback.format_exc()}")
             st.stop()
 
 # ------------------------------
@@ -667,11 +697,11 @@ else:
 # ------------------------------
 with st.sidebar:
     st.markdown("---")
-    st.subheader("Tips")
+    st.subheader("Conseils")
     st.write(
-        "- For Hugging Face bundles: pass repo id (e.g., `Project-MONAI/your-bundle`).\n"
-        "- For local bundles: point to folder with `configs/` + `models/`.\n"
-        "- Adjust spacing & intensity to match modality.\n"
-        "- Enable robust preprocessing for 4D+ images.\n"
-        "- Sliding window inference used for 3D volumes."
+        "- Pour les bundles Hugging Face : indiquez l'ID du repo (ex.: `Project-MONAI/votre-bundle`).\n"
+        "- Pour les bundles locaux : indiquez le dossier contenant `configs/` + `models/`.\n"
+        "- Ajustez l'espacement et l'intensité en fonction de la modalité.\n"
+        "- Activez le prétraitement robuste pour les images 4D+.\n"
+        "- L'inférence en fenêtre glissante est utilisée pour les volumes 3D."
     )
